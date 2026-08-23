@@ -9,11 +9,18 @@ BASELINES = {"supply_air_temperature":14.0,"return_air_temperature":23.0,"airflo
 CHART_MAXIMA = {"supply_air_temperature":25.0,"return_air_temperature":35.0,"airflow":6000.0,"filter_differential_pressure":300.0,"motor_current":20.0,"fan_vibration":6.0,"temperature_setpoint":30.0}
 BOUNDS = {"supply_air_temperature":(10,22),"return_air_temperature":(18,30),"airflow":(1800,5200),"filter_differential_pressure":(40,260),"motor_current":(4,18),"fan_vibration":(.3,5),"temperature_setpoint":(18,24)}
 RANGES = {"1m":(60,1),"1h":(120,30),"1d":(144,600)}
+FAULTS = {
+    "filter_clog": {"label":"Clogged filter","description":"Rising filter pressure with reduced airflow"},
+    "coil_fouling": {"label":"Cooling coil fouling","description":"Supply temperature drifts high as heat transfer falls"},
+    "fan_imbalance": {"label":"Fan imbalance","description":"Vibration and motor load increase while airflow falls"},
+    "belt_slip": {"label":"Drive belt slip","description":"Airflow collapses while motor current unloads"},
+}
 
 class HVAC001Simulator:
     def __init__(self, history_limit=120, seed=None):
         self.history_limit=history_limit; self._history=deque(maxlen=history_limit); self._lock=threading.Lock(); self._rng=random.Random(seed); self._last=0.0
-        self._values={"supply_air_temperature":14.4,"return_air_temperature":23.7,"airflow":3680.,"filter_differential_pressure":91.,"motor_current":10.4,"fan_vibration":1.15,"temperature_setpoint":20.0}; self._sample(time.time())
+        self._values={"supply_air_temperature":14.4,"return_air_temperature":23.7,"airflow":3680.,"filter_differential_pressure":91.,"motor_current":10.4,"fan_vibration":1.15,"temperature_setpoint":20.0}
+        self._fault_targets={key:False for key in FAULTS}; self._fault_levels={key:0.0 for key in FAULTS}; self._sample(time.time())
     def _severity(self, key, value):
         warn={"supply_air_temperature":(12,18),"return_air_temperature":(20,27),"airflow":(2300,4700),"filter_differential_pressure":(0,170),"motor_current":(0,14),"fan_vibration":(0,2.8),"temperature_setpoint":(18,24)}
         alarm={"supply_air_temperature":(10.8,20),"return_air_temperature":(19,29),"airflow":(1950,5000),"filter_differential_pressure":(0,225),"motor_current":(0,16.5),"fan_vibration":(0,4.2),"temperature_setpoint":(18,24)}
@@ -22,18 +29,45 @@ class HVAC001Simulator:
         alo,ahi=alarm[key]
         return "warning" if alo<=value<=ahi else "alarm"
     def _sample(self, now):
+        # Faults ramp in and recover gradually so trends resemble equipment behavior.
+        for key,active in self._fault_targets.items():
+            target=1.0 if active else 0.0; rate=.035 if active else .055
+            self._fault_levels[key]+=max(-rate,min(rate,target-self._fault_levels[key]))
         phase=now/38; target_set=20+.25*math.sin(phase/4); self._values["temperature_setpoint"]+=(target_set-self._values["temperature_setpoint"])*.08
-        ret_target=23.5+1.1*math.sin(phase/3); self._values["return_air_temperature"]+=(ret_target-self._values["return_air_temperature"])*.06+self._rng.uniform(-.06,.06)
+        coil=self._fault_levels["coil_fouling"]; clogged=self._fault_levels["filter_clog"]; imbalance=self._fault_levels["fan_imbalance"]; slip=self._fault_levels["belt_slip"]
+        ret_target=23.5+1.1*math.sin(phase/3)+.5*coil; self._values["return_air_temperature"]+=(ret_target-self._values["return_air_temperature"])*.06+self._rng.uniform(-.06,.06)
         load=max(0,min(1,(self._values["return_air_temperature"]-self._values["temperature_setpoint"])/6+.35)); airflow_target=2800+1700*load
+        airflow_target-=900*clogged+320*imbalance+1450*slip
         self._values["airflow"]+=(airflow_target-self._values["airflow"])*.09+self._rng.uniform(-18,18)
-        self._values["supply_air_temperature"]+=(14.2+.6*(1-load)-self._values["supply_air_temperature"])*.1+self._rng.uniform(-.04,.04)
-        self._values["filter_differential_pressure"]+=(72+self._values["airflow"]/95-self._values["filter_differential_pressure"])*.04+self._rng.uniform(-.5,.5)
-        self._values["motor_current"]+=(3.5+self._values["airflow"]/540-self._values["motor_current"])*.12+self._rng.uniform(-.04,.04)
-        self._values["fan_vibration"]+=(.65+self._values["motor_current"]*.045-self._values["fan_vibration"])*.08+self._rng.uniform(-.015,.015)
+        supply_target=14.2+.6*(1-load)+5.2*coil
+        self._values["supply_air_temperature"]+=(supply_target-self._values["supply_air_temperature"])*.1+self._rng.uniform(-.04,.04)
+        pressure_target=72+self._values["airflow"]/95+180*clogged
+        self._values["filter_differential_pressure"]+=(pressure_target-self._values["filter_differential_pressure"])*.07+self._rng.uniform(-.5,.5)
+        current_target=3.5+self._values["airflow"]/540+1.4*clogged+2.8*imbalance-2.2*slip
+        self._values["motor_current"]+=(current_target-self._values["motor_current"])*.12+self._rng.uniform(-.04,.04)
+        vibration_target=.65+self._values["motor_current"]*.045+4.0*imbalance+1.0*slip
+        self._values["fan_vibration"]+=(vibration_target-self._values["fan_vibration"])*.1+self._rng.uniform(-.015,.015)
         for k,(lo,hi) in BOUNDS.items(): self._values[k]=max(lo,min(hi,self._values[k]))
         values={k:{"value":round(v,0 if k in {"airflow","filter_differential_pressure"} else 2),"unit":UNITS[k],"severity":self._severity(k,v)} for k,v in self._values.items()}
-        reading={"timestamp":datetime.fromtimestamp(now,timezone.utc).isoformat(),"hvac_on":True,"state":{"value":"ON","severity":"nominal"},"values":values,"status":"nominal"}
+        status="alarm" if any(x["severity"]=="alarm" for x in values.values()) else "warning" if any(x["severity"]=="warning" for x in values.values()) else "nominal"
+        state_value="FAULT" if status=="alarm" else "DEGRADED" if status=="warning" else "ON"
+        reading={"timestamp":datetime.fromtimestamp(now,timezone.utc).isoformat(),"hvac_on":True,"state":{"value":state_value,"severity":status},"values":values,"status":status}
         self._history.append(reading); self._last=now
+
+    def set_fault(self, fault_id, active):
+        if fault_id not in FAULTS: raise ValueError("unknown fault")
+        if not isinstance(active,bool): raise TypeError("active must be a boolean")
+        with self._lock:
+            self._fault_targets[fault_id]=active
+            return self._fault_state()
+
+    def reset_faults(self):
+        with self._lock:
+            for key in self._fault_targets: self._fault_targets[key]=False
+            return self._fault_state()
+
+    def _fault_state(self):
+        return [{"id":key,**definition,"active":self._fault_targets[key],"level":round(self._fault_levels[key],2)} for key,definition in FAULTS.items()]
     def snapshot(self):
         return self.snapshot_range("1m")
 
@@ -56,7 +90,7 @@ class HVAC001Simulator:
                 history=[self._historical_reading(now-(count-1-i)) for i in range(missing)]+recent
             else: history=[self._historical_reading(now-step*(count-1-i)) for i in range(count-1)]+[self._history[-1]]
             metadata={k:{"unit":UNITS[k],"baseline":BASELINES[k],"chart_max":CHART_MAXIMA[k]} for k in UNITS}
-            return {"asset_id":"HVAC-001","range":range_key,"poll_interval_ms":1000,"reading":self._history[-1],"history":history,"metadata":metadata}
+            return {"asset_id":"HVAC-001","range":range_key,"poll_interval_ms":1000,"reading":self._history[-1],"history":history,"metadata":metadata,"faults":self._fault_state()}
 
 if __name__ == "__main__":
     sim=HVAC001Simulator()
